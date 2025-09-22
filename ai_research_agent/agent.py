@@ -7,6 +7,31 @@ import trafilatura
 import google.generativeai as genai
 from tavily import TavilyClient
 from dotenv import load_dotenv
+from datetime import datetime
+
+# --- NEW: DATABASE SETUP (using SQLAlchemy) ---
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# Define the database connection
+DATABASE_URL = "sqlite:///research_reports.db"
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Define the Report table model
+class Report(Base):
+    __tablename__ = "reports"
+    id = Column(Integer, primary_key=True, index=True)
+    query = Column(String, index=True)
+    report_content = Column(Text)
+    sources = Column(Text) # Storing sources as a comma-separated string
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# Create the table in the database if it doesn't exist
+Base.metadata.create_all(bind=engine)
+# --- END NEW SECTION ---
+
 
 # --- 1. SETUP ---
 # Load environment variables from .env file
@@ -14,10 +39,7 @@ load_dotenv()
 
 # Configure the API clients
 try:
-    # [cite_start]An agent that combines an LLM + exactly 2 tools (fixed): 1. Web Search API... 2. Content Extractor [cite: 11]
-    # Configure Gemini
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    # Configure Tavily
     tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 except TypeError:
     print("Error: One or more API keys not found. Make sure they are in your .env file.")
@@ -26,15 +48,14 @@ except TypeError:
 # Instantiate the Gemini model
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
+
 # --- 2. CORE FUNCTIONS ---
 
 def search_online(query: str, max_results=3):
     """Searches online using Tavily and returns a list of URLs."""
     print(f"🔎 Searching online for: '{query}'...")
     try:
-        # [cite_start]Find 2-3 useful sources online. [cite: 5]
         response = tavily_client.search(query=query, search_depth="basic", max_results=max_results)
-        # Return the URLs from the search results
         return [obj["url"] for obj in response["results"]]
     except Exception as e:
         print(f"Error during online search: {e}")
@@ -46,23 +67,18 @@ def extract_content_from_url(url: str):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'}
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # Raise an exception for bad status codes
+        response.raise_for_status()
 
-        # Check content type for PDF
         if 'application/pdf' in response.headers.get('Content-Type', ''):
-            # [cite_start]Content Extractor: ... pypdf for PDFs [cite: 13]
             with io.BytesIO(response.content) as f:
                 reader = pypdf.PdfReader(f)
                 text = "".join(page.extract_text() for page in reader.pages)
-        # Otherwise, assume HTML
         else:
-            # [cite_start]Content Extractor: trafilatura/readability for HTML [cite: 13]
             text = trafilatura.extract(response.text)
         
         return text
             
     except Exception as e:
-        # [cite_start]If a page blocks scraping, show that gracefully and skip. [cite: 17]
         print(f"❗️ Gracefully skipping URL {url} due to error: {e}")
         return None
 
@@ -72,8 +88,6 @@ def summarize_with_gemini(text: str, query: str):
         return "Error: No text was extracted for summarization."
     
     print("🤖 Summarizing content with Gemini...")
-    # [cite_start]Summarize what you found using an LLM. [cite: 6]
-    # [cite_start]Create a short, structured report with key points and links. [cite: 7]
     prompt = f"""
     Based on the following extracted text and the original user query, create a short, structured report.
     The report must include:
@@ -93,6 +107,28 @@ def summarize_with_gemini(text: str, query: str):
         return response.text
     except Exception as e:
         return f"An error occurred during summarization: {e}"
+
+# --- NEW: Function to save report to the database ---
+def save_report_to_db(query: str, report_content: str, sources: list):
+    """Saves the generated report and its metadata to the SQLite database."""
+    db = SessionLocal()
+    try:
+        new_report = Report(
+            query=query,
+            report_content=report_content,
+            sources=", ".join(sources) # Join list of URLs into a single string
+        )
+        db.add(new_report)
+        db.commit()
+        db.refresh(new_report)
+        print(f"💾 Report for query '{query}' saved to database.")
+    except Exception as e:
+        print(f"Error saving report to database: {e}")
+        db.rollback()
+    finally:
+        db.close()
+# --- END NEW SECTION ---
+
 
 # --- 3. MAIN WORKFLOW ---
 
@@ -121,9 +157,14 @@ def run_agent(query: str):
     print("\n--- SOURCES ---")
     for url in urls:
         print(f"- {url}")
+        
+    # --- NEW: Save the report ---
+    if final_report:
+        save_report_to_db(query, final_report, urls)
+    # --- END NEW SECTION ---
+
 
 # --- EXECUTION ---
 if __name__ == '__main__':
-    # [cite_start]Take a user query (e.g., "Latest research on Al in education", "Impact of Mediterranean diet on heart health", etc.). [cite: 4]
-    user_query = "Latest research on AI in education"
+    user_query = "Impact of Mediterranean diet on heart health"
     run_agent(user_query)
